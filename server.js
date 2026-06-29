@@ -722,7 +722,7 @@ function buildToolCallResponse(toolCall, model = 'deepseek-default', prompt = ''
     };
 }
 
-function buildTextResponse(content, prompt, model = 'deepseek-default', reasoningContent = '') {
+function buildTextResponse(content, prompt, model = 'deepseek-default', reasoningContent = '', finishReason = null) {
     const message = { role: 'assistant', content };
     if (reasoningContent) message.reasoning_content = reasoningContent;
     return {
@@ -733,7 +733,9 @@ function buildTextResponse(content, prompt, model = 'deepseek-default', reasonin
         choices: [{
             index: 0,
             message,
-            finish_reason: 'stop'
+            // Surface truncation: a 'length' finish lets length-aware clients re-request
+            // instead of silently treating a cut-off answer as a clean stop.
+            finish_reason: finishReason === 'length' ? 'length' : 'stop'
         }],
         usage: buildUsage(prompt, content, reasoningContent),
         watermark: FORGETMEAI_WATERMARK
@@ -1266,6 +1268,10 @@ const server = http.createServer(async (req, res) => {
             }
 
             const { prompt, systemPrompt } = formatMessages(messages, tools);
+            // For usage accounting, count the CLIENT's original input — not the
+            // proxy-expanded fullPrompt (system + injected tools + history) — so
+            // prompt_tokens reflects what the caller actually sent.
+            const clientPromptText = messages.map(m => normalizeMessageContent(m.content)).join('\n');
 
             const session = getOrCreateAgentSession(agentId);
 
@@ -1502,8 +1508,8 @@ const server = http.createServer(async (req, res) => {
             storeHistory(agentId, prompt, fullContent, toolCall);
 
             const openaiResponse = toolCall
-                ? buildToolCallResponse(toolCall, requestedModel, fullPrompt, reasoningContent)
-                : buildTextResponse(fullContent, fullPrompt, requestedModel, reasoningContent);
+                ? buildToolCallResponse(toolCall, requestedModel, clientPromptText, reasoningContent)
+                : buildTextResponse(fullContent, clientPromptText, requestedModel, reasoningContent, finishReason);
 
             if (stream) {
                 if (apiMode === 'anthropic') {
