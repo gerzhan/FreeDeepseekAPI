@@ -447,7 +447,7 @@ FreeDeepseekAPI принимает:
 Прокси просит DeepSeek вернуть строгий JSON tool call, но также умеет парсить fallback-форматы:
 
 - `TOOL_CALL:`
-- fenced JSON
+- fenced JSON with an explicit `tool_call`, `tool_calls`, or `function_call` envelope
 - `<tool_call>...</tool_call>`
 - DeepSeek DSML (`<｜DSML｜tool_calls>...`) и Web-вариант с `<｜｜DSML｜｜ Tool Calls>`
 

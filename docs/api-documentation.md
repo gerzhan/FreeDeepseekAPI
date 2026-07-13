@@ -359,7 +359,7 @@ DeepSeek Web does not expose native OpenAI tool calls, so the proxy prompt-emula
 
 - strict JSON: `{"tool_call":{"name":"tool","arguments":{...}}}`
 - legacy format: `TOOL_CALL: tool\narguments: {...}`
-- fenced JSON blocks
+- fenced JSON blocks with an explicit `tool_call`, `tool_calls`, or `function_call` envelope
 - XML-ish `<tool_call>{...}</tool_call>` wrappers
 - DeepSeek DSML (`<｜DSML｜tool_calls>...`) and the doubled-bar Web variant
 
@@ -440,8 +440,8 @@ The proxy uses `user` from the request body. If not set, it falls back to the cl
   id: "uuid",                    // DeepSeek web session ID
   parentMessageId: <int|null>,   // Last message ID for threading
   createdAt: <timestamp>,        // Session creation time
-  messageCount: 0-50,            // Messages in this session
-  history: [                     // Last 5 exchanges for context recovery
+  messageCount: 0-100,           // Messages in this session
+  history: [                     // Last 15 exchanges for context recovery
     { user: "...", assistant: "..." }
   ]
 }

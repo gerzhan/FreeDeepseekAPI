@@ -6,7 +6,7 @@
  * parses LLM text responses for TOOL_CALL patterns, returns OpenAI tool_calls format.
  * 
  * Per-agent sessions: each unique `user` field gets its own DeepSeek web session.
- * Auto-reset: sessions reset when message chain > 50 messages or age > 2 hours.
+ * Auto-reset: sessions reset when message chain reaches 100 messages or age > 2 hours.
  * Listens on 127.0.0.1:9655 by default (HOST is configurable)
  */
 
@@ -465,6 +465,19 @@ function isDeepSeekModelErrorEvent(event) {
     return event && event.type === 'error';
 }
 
+function createUpstreamHttpError(status, body = '', retryAfter = null) {
+    const code = Number(status) || 502;
+    const detail = String(body || '').replace(/\s+/g, ' ').trim().substring(0, 300);
+    const type = code === 429
+        ? 'rate_limit_error'
+        : ((code === 401 || code === 403) ? 'authentication_error' : 'upstream_http_error');
+    const error = new Error(`DeepSeek upstream HTTP ${code}${detail ? `: ${detail}` : ''}`);
+    error.status = code;
+    error.type = type;
+    if (retryAfter) error.retryAfter = retryAfter;
+    return error;
+}
+
 function rebuildFragmentText(fragments) {
     const responseText = fragments
         .filter(isAssistantOutputFragment)
@@ -497,7 +510,7 @@ function resolveModelConfig(model) {
 function isKnownModel(model) { return Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, String(model || '').toLowerCase()); }
 function isSupportedModel(model) { return resolveModelConfig(model).supported === true; }
 
-async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
+async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt) {
     const modelCfg = resolveModelConfig(model);
     const session = getOrCreateAgentSession(agentId);
     const account = selectAccountForSession(session);
@@ -509,6 +522,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     // recovery history can be injected. Keep this guard for direct callers and
     // concurrent requests that may have advanced the same session meanwhile.
     const rollover = prepareSessionForPrompt(session);
+    let effectivePrompt = rollover ? freshSessionPrompt : prompt;
     if (rollover) {
         console.log(`${agentTag} Session ${rollover.failedSessionId} reset before upstream call (${rollover.reason}).`);
     }
@@ -562,7 +576,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
             chat_session_id: session.id,
             parent_message_id: session.parentMessageId,
             model_type: modelCfg.model_type,
-            prompt: prompt, ref_file_ids: [],
+            prompt: effectivePrompt, ref_file_ids: [],
             thinking_enabled: modelCfg.thinking_enabled, search_enabled: modelCfg.search_enabled,
             action: null, preempt: false,
         })
@@ -571,7 +585,8 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     // If session expired, reset and retry once
     if (resp.status !== 200) {
         // Pass Retry-After so a 429 honors the server-requested cooldown (#16).
-        markAccountFailure(account, resp.status, 'completion', resp.headers.get('retry-after'));
+        const retryAfter = resp.headers.get('retry-after');
+        markAccountFailure(account, resp.status, 'completion', retryAfter);
         const errText = await resp.text();
         console.log(`${agentTag} Session error (${resp.status}): ${errText.substring(0, 100)}`);
         if (resp.status === 400 || resp.status === 404 || resp.status === 500) {
@@ -604,35 +619,64 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
                     chat_session_id: session.id,
                     parent_message_id: null,
                     model_type: modelCfg.model_type,
-                    prompt: prompt, ref_file_ids: [],
+                    prompt: freshSessionPrompt, ref_file_ids: [],
                     thinking_enabled: modelCfg.thinking_enabled, search_enabled: modelCfg.search_enabled,
                     action: null, preempt: false,
                 })
             });
-            return { resp: resp2, agentId, account };
+            if (!resp2.ok) {
+                const retryAfter2 = resp2.headers.get('retry-after');
+                markAccountFailure(account, resp2.status, 'completion after session recreate', retryAfter2);
+                const errText2 = await resp2.text();
+                throw createUpstreamHttpError(resp2.status, errText2, retryAfter2);
+            }
+            effectivePrompt = freshSessionPrompt;
+            return { resp: resp2, agentId, account, promptUsed: effectivePrompt, freshSessionReset: true };
         }
+        // The body was consumed for diagnostics, so returning this Response
+        // would hand a locked stream to readDeepSeekResponse. Surface a typed
+        // error instead and retain the real upstream status/Retry-After.
+        throw createUpstreamHttpError(resp.status, errText, retryAfter);
     }
 
-    return { resp, agentId, account };
+    return { resp, agentId, account, promptUsed: effectivePrompt, freshSessionReset: Boolean(rollover) };
 }
 
 // === Tool Calling Support ===
 
 const TOOL_SCHEMA_ANNOTATION_KEYS = new Set(['description', 'examples', '$comment', 'title']);
 const TOOL_SCHEMA_MAP_KEYS = new Set(['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas']);
+const TOOL_SCHEMA_ARRAY_KEYS = new Set(['allOf', 'anyOf', 'oneOf', 'prefixItems']);
+const TOOL_SCHEMA_SINGLE_KEYS = new Set([
+    'additionalItems', 'additionalProperties', 'contains', 'contentSchema', 'else', 'if',
+    'items', 'not', 'propertyNames', 'then', 'unevaluatedItems', 'unevaluatedProperties',
+]);
 
-function compactToolSchema(value, preserveMapKeys = false) {
-    if (Array.isArray(value)) return value.map(child => compactToolSchema(child, false));
+function compactToolSchema(value) {
+    if (Array.isArray(value)) return value.map(compactToolSchema);
     if (!value || typeof value !== 'object') return value;
     const compact = {};
     for (const [key, child] of Object.entries(value)) {
         // Descriptions/examples dominate large agent tool payloads but do not
-        // affect argument validation. A schema can also legally define an
-        // argument *named* "description" or "title", so keys inside schema maps
-        // must not be mistaken for annotations.
-        if (!preserveMapKeys && TOOL_SCHEMA_ANNOTATION_KEYS.has(key)) continue;
-        const childIsSchemaMap = !preserveMapKeys && TOOL_SCHEMA_MAP_KEYS.has(key);
-        compact[key] = compactToolSchema(child, childIsSchemaMap);
+        // affect argument validation. Traverse only keywords whose values are
+        // themselves schemas. Literal instance values under const/enum/default
+        // must remain byte-for-byte equivalent, even when they contain fields
+        // named "description" or "title".
+        if (TOOL_SCHEMA_ANNOTATION_KEYS.has(key)) continue;
+        if (TOOL_SCHEMA_MAP_KEYS.has(key) && child && typeof child === 'object' && !Array.isArray(child)) {
+            compact[key] = Object.fromEntries(Object.entries(child).map(([name, schema]) => [name, compactToolSchema(schema)]));
+        } else if (TOOL_SCHEMA_ARRAY_KEYS.has(key) && Array.isArray(child)) {
+            compact[key] = child.map(compactToolSchema);
+        } else if (TOOL_SCHEMA_SINGLE_KEYS.has(key)) {
+            compact[key] = Array.isArray(child) ? child.map(compactToolSchema) : compactToolSchema(child);
+        } else if (key === 'dependencies' && child && typeof child === 'object' && !Array.isArray(child)) {
+            compact[key] = Object.fromEntries(Object.entries(child).map(([name, dependency]) => [
+                name,
+                Array.isArray(dependency) ? dependency : compactToolSchema(dependency),
+            ]));
+        } else {
+            compact[key] = child;
+        }
     }
     return compact;
 }
@@ -1225,7 +1269,7 @@ function writeSse(res, event, data) {
 }
 
 function sendAnthropicStream(res, openaiResp) {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*' });
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
     const choice = openaiResp.choices[0];
     const msg = choice.message || {};
     const message = toAnthropicResponse(openaiResp);
@@ -1296,7 +1340,7 @@ function toResponsesResponse(openaiResp) {
 }
 
 function sendResponsesStream(res, openaiResp) {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*' });
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
     const response = toResponsesResponse(openaiResp);
     const choice = openaiResp.choices[0];
     const msg = choice.message || {};
@@ -1338,7 +1382,7 @@ function sendResponsesStream(res, openaiResp) {
 }
 
 function sendOpenAIStream(res, openaiResp) {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*' });
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
     const choice = openaiResp.choices[0];
     const msg = choice.message || {};
     const id = openaiResp.id;
@@ -1441,6 +1485,15 @@ function hasExplicitConversationHistory(messages) {
     return turns.length > 1 || turns.some(msg => msg.role === 'assistant' || msg.role === 'tool');
 }
 
+function buildRecoveryHistoryPrefix(history) {
+    if (!Array.isArray(history) || history.length === 0) return '';
+    let prefix = '[Previous conversation]\n';
+    for (const exchange of history) {
+        prefix += `User: ${String(exchange?.user || '')}\nAssistant: ${String(exchange?.assistant || '')}\n\n`;
+    }
+    return prefix + '[Continue from here]\n\n';
+}
+
 function buildBoundedPrompt(systemPrompt, historyPrefix, conversationPrompt, maxChars = MAX_UPSTREAM_PROMPT_CHARS) {
     const system = String(systemPrompt || '').trim();
     const history = String(historyPrefix || '');
@@ -1488,13 +1541,12 @@ function buildBoundedPrompt(systemPrompt, historyPrefix, conversationPrompt, max
 function buildRetryPrompt(systemPrompt, historyPrefix, conversationPrompt, currentPrompt, maxChars) {
     const retryBuild = buildBoundedPrompt(systemPrompt, historyPrefix, conversationPrompt, maxChars);
     const current = String(currentPrompt || '');
-    const prompt = retryBuild.prompt.length < current.length ? retryBuild.prompt : current;
     return {
-        prompt,
-        compacted: prompt.length < current.length,
-        historyDropped: prompt === retryBuild.prompt && retryBuild.historyDropped,
+        ...retryBuild,
+        compacted: retryBuild.compacted || retryBuild.prompt.length < current.length,
         originalChars: retryBuild.originalChars,
-        promptChars: prompt.length,
+        promptChars: retryBuild.prompt.length,
+        previousPromptChars: current.length,
     };
 }
 
@@ -1788,17 +1840,16 @@ const server = http.createServer(async (req, res) => {
                 console.log(`${agentTag} Session ${promptRollover.failedSessionId} reset before prompt build (${promptRollover.reason}); recovery history preserved.`);
             }
 
-            // Build history prefix if starting fresh
-            let historyPrefix = '';
-            if (!session.id && session.history.length > 0 && !hasExplicitConversationHistory(messages)) {
-                historyPrefix = '[Previous conversation]\n';
-                for (const exchange of session.history) {
-                    historyPrefix += `User: ${exchange.user}\nAssistant: ${exchange.assistant}\n\n`;
-                }
-                historyPrefix += '[Continue from here]\n\n';
-            }
+            // Keep a recovery prompt available even while the upstream session
+            // is healthy. If that remote chat expires mid-request, its opaque
+            // state disappears and the replacement must receive local history.
+            const recoveryHistoryPrefix = hasExplicitConversationHistory(messages)
+                ? ''
+                : buildRecoveryHistoryPrefix(session.history);
+            const historyPrefix = !session.id ? recoveryHistoryPrefix : '';
 
             const promptBuild = buildBoundedPrompt(systemPrompt, historyPrefix, prompt);
+            const freshPromptBuild = buildBoundedPrompt(systemPrompt, recoveryHistoryPrefix, prompt);
             let fullPrompt = promptBuild.prompt;
             let promptCompacted = promptBuild.compacted;
             if (promptBuild.compacted) {
@@ -1807,7 +1858,15 @@ const server = http.createServer(async (req, res) => {
             }
 
             const startTime = Date.now();
-            const { resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
+            const initialCall = await askDeepSeekStream(fullPrompt, agentId, requestedModel, freshPromptBuild.prompt);
+            const dsResp = initialCall.resp;
+            if (initialCall.promptUsed !== fullPrompt) {
+                fullPrompt = initialCall.promptUsed;
+                if (freshPromptBuild.compacted) {
+                    promptCompacted = true;
+                    markContextCompacted(res);
+                }
+            }
 
             // Process streaming response from DeepSeek — returns { content, reasoningContent, messageId, finishReason }
             async function readDeepSeekResponse(readable) {
@@ -1926,7 +1985,7 @@ const server = http.createServer(async (req, res) => {
                     ? Math.max(0.35, 0.8 - retryAttempt * 0.2)
                     : Math.max(0.5, 1 - retryAttempt * 0.2);
                 const retryBudget = Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(MAX_UPSTREAM_PROMPT_CHARS * retryRatio));
-                const retryBuild = buildRetryPrompt(systemPrompt, historyPrefix, prompt, fullPrompt, retryBudget);
+                const retryBuild = buildRetryPrompt(systemPrompt, recoveryHistoryPrefix, prompt, fullPrompt, retryBudget);
                 const retryPrompt = retryBuild.prompt;
                 if (retryBuild.compacted) {
                     promptCompacted = true;
@@ -1992,7 +2051,16 @@ const server = http.createServer(async (req, res) => {
                 console.log(`${agentTag} Response ${fullContent.length} chars (finish=${finishReason}). Auto-continuing (${continuationRounds}/${MAX_CONTINUATION})...`);
                 await new Promise(r => setTimeout(r, 500));
                 const contBeforeId = session.accountId;
-                const { resp: contResp, account: contAccount } = await askDeepSeekStream('continue', agentId, requestedModel);
+                const continuationRecoveryPrompt = appendPromptInstruction(
+                    `${freshPromptBuild.prompt}\n\n[Assistant response so far]\n${fullContent}`,
+                    'Continue the assistant response from exactly where it stopped. Do not restart or repeat completed sections.'
+                );
+                const { resp: contResp, account: contAccount } = await askDeepSeekStream(
+                    'continue',
+                    agentId,
+                    requestedModel,
+                    continuationRecoveryPrompt
+                );
                 // If rotation moved us to a different account, its chat_session has no
                 // prior context — "continue" would return irrelevant text. Abort (#20).
                 if (contAccount && contBeforeId && contAccount.id !== contBeforeId) {
@@ -2029,7 +2097,7 @@ const server = http.createServer(async (req, res) => {
                 resetRemoteSession(session);
                 await new Promise(r => setTimeout(r, 1000));
                 const strictPrompt = appendPromptInstruction(
-                    fullPrompt,
+                    freshPromptBuild.prompt,
                     '[STRICT INSTRUCTION] Your previous response contained incomplete tool-call markup. Keep arguments short and output ONLY strict JSON: {"tool_call":{"name":"<function>","arguments":{...}}}'
                 );
                 const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel);
@@ -2233,6 +2301,7 @@ module.exports = {
         isAssistantOutputFragment,
         isReasoningFragment,
         isDeepSeekModelErrorEvent,
+        createUpstreamHttpError,
         rebuildFragmentText,
         applyResponsePatchOperations,
         compactToolSchema,
@@ -2242,6 +2311,7 @@ module.exports = {
         looksLikeToolCallMarkup,
         truncatePromptMiddle,
         hasExplicitConversationHistory,
+        buildRecoveryHistoryPrefix,
         buildBoundedPrompt,
         buildRetryPrompt,
         isContextTooLongError,
@@ -2261,5 +2331,8 @@ module.exports = {
         setCorsResponseHeaders,
         markContextCompacted,
         CONTEXT_COMPACTED_HEADER,
+        sendAnthropicStream,
+        sendResponsesStream,
+        sendOpenAIStream,
     },
 };

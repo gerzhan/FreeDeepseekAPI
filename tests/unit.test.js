@@ -180,6 +180,18 @@ test('DeepSeek stream parser does not treat service content chunks as model erro
   assert.equal(serverInternals.isDeepSeekModelErrorEvent({ type: 'error', content: 'backend error' }), true);
 });
 
+test('consumed upstream HTTP errors retain status, type, and retry hints', () => {
+  const limited = serverInternals.createUpstreamHttpError(429, '  Rate limited\ntry later  ', '12');
+  assert.equal(limited.status, 429);
+  assert.equal(limited.type, 'rate_limit_error');
+  assert.equal(limited.retryAfter, '12');
+  assert.match(limited.message, /Rate limited try later/);
+
+  const unauthorized = serverInternals.createUpstreamHttpError(401, 'expired');
+  assert.equal(unauthorized.status, 401);
+  assert.equal(unauthorized.type, 'authentication_error');
+});
+
 test('sweepIdleSessions evicts only idle entries', () => {
   serverInternals.sessions.set('stale-x', { lastActivityAt: 1 });
   serverInternals.sessions.set('fresh-x', { lastActivityAt: Date.now() });
@@ -372,6 +384,35 @@ test('tool schema compaction drops prose annotations but preserves validation sh
   });
 });
 
+test('tool schema compaction preserves literal const, enum, and default values', () => {
+  const literals = {
+    type: 'object',
+    description: 'drop this annotation',
+    const: { description: 'literal field', title: 'literal title', nested: { examples: ['literal'] } },
+    enum: [
+      { description: 'first', value: 1 },
+      { title: 'second', value: 2 },
+    ],
+    default: { description: 'default literal', title: 'default title' },
+    properties: {
+      choice: {
+        description: 'drop nested annotation',
+        const: { description: 'required argument value', title: 'keep me' },
+      },
+    },
+  };
+
+  assert.deepEqual(serverInternals.compactToolSchema(literals), {
+    type: 'object',
+    const: literals.const,
+    enum: literals.enum,
+    default: literals.default,
+    properties: {
+      choice: { const: literals.properties.choice.const },
+    },
+  });
+});
+
 test('buildBoundedPrompt preserves task edges and drops duplicate recovery history', () => {
   const system = `SYSTEM_START\n${'s'.repeat(50000)}\nTOOL_ADAPTER_END`;
   const history = `[Previous conversation]\n${'h'.repeat(10000)}\n`;
@@ -424,6 +465,28 @@ test('empty-response retry keeps recovery history unless a smaller global cap re
   assert.ok(smallerRetry.prompt.length <= 4000);
   assert.match(smallerRetry.prompt, /TASK_START/);
   assert.match(smallerRetry.prompt, /LATEST_RESULT/);
+});
+
+test('fresh-session retry restores local history that a healthy remote session initially omitted', () => {
+  const system = 'SYSTEM';
+  const history = serverInternals.buildRecoveryHistoryPrefix([
+    { user: 'original task', assistant: 'original answer' },
+  ]);
+  const conversation = 'User: follow up';
+  const establishedSessionPrompt = serverInternals.buildBoundedPrompt(system, '', conversation, 5000).prompt;
+  const freshSessionRetry = serverInternals.buildRetryPrompt(
+    system,
+    history,
+    conversation,
+    establishedSessionPrompt,
+    5000,
+  );
+
+  assert.ok(freshSessionRetry.prompt.length > establishedSessionPrompt.length);
+  assert.match(freshSessionRetry.prompt, /Previous conversation/);
+  assert.match(freshSessionRetry.prompt, /original task/);
+  assert.match(freshSessionRetry.prompt, /original answer/);
+  assert.match(freshSessionRetry.prompt, /follow up/);
 });
 
 test('remote reset preserves local history and sticky account while returning failure diagnostics', () => {
@@ -515,4 +578,29 @@ test('context-compaction header is marked and exposed to browser clients', () =>
 
   assert.equal(headers.get('Access-Control-Expose-Headers'), serverInternals.CONTEXT_COMPACTED_HEADER);
   assert.equal(headers.get(serverInternals.CONTEXT_COMPACTED_HEADER), 'true');
+});
+
+test('stream helpers preserve the request-level exact CORS origin', () => {
+  const response = {
+    id: 'ds-test',
+    created: 1,
+    model: 'deepseek-chat',
+    choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  };
+
+  for (const send of [
+    serverInternals.sendAnthropicStream,
+    serverInternals.sendResponsesStream,
+    serverInternals.sendOpenAIStream,
+  ]) {
+    let writeHeadHeaders = null;
+    const res = {
+      writeHead: (_status, headers) => { writeHeadHeaders = headers; },
+      write: () => {},
+      end: () => {},
+    };
+    send(res, response);
+    assert.equal(Object.hasOwn(writeHeadHeaders, 'Access-Control-Allow-Origin'), false);
+  }
 });
