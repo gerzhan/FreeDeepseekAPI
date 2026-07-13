@@ -121,6 +121,21 @@ SKIP_ACCOUNT_MENU=1 npm start
 http://localhost:9655
 ```
 
+По умолчанию proxy доступен только с этого компьютера. Для доступа из сети
+явно задайте адрес и отдельный ключ proxy:
+
+```bash
+HOST=0.0.0.0 PROXY_API_KEY='replace-with-a-long-random-value' npm start
+```
+
+После этого передавайте ключ как `Authorization: Bearer <key>`. Без
+`PROXY_API_KEY` non-health endpoints остаются без авторизации, поэтому не
+публикуйте такой экземпляр в сеть.
+
+Browser-запросы разрешены с loopback-origin. Если UI открыт на другом адресе,
+добавьте его точный origin через запятую, например
+`PROXY_CORS_ORIGINS=https://ui.example.com,http://192.168.1.20:3000`.
+
 ---
 
 ## 🪟 Windows запуск
@@ -230,6 +245,9 @@ FreeDeepseekAPI не создаёт новый DeepSeek чат на каждый
 - если session id уже есть — proxy переиспользует его и продолжает chain через `parent_message_id`;
 - auto-reset происходит при TTL, ошибке DeepSeek session или слишком длинной цепочке сообщений;
 - локальная history сохраняется коротким контекстом, чтобы новая DeepSeek session могла продолжить разговор.
+- длинные agent-запросы перед отправкой ограничиваются `DEEPSEEK_MAX_PROMPT_CHARS` (по умолчанию 80 000 символов): сохраняются начало задачи, свежие tool results и tool adapter;
+- если клиент уже прислал multi-turn history, локальная recovery-history второй раз не добавляется;
+- пустой ответ повторяется максимум `DEEPSEEK_MAX_RETRIES` раз (по умолчанию 2), причём на каждом retry контекст уменьшается.
 
 Явно задать agent/session:
 
@@ -429,8 +447,9 @@ FreeDeepseekAPI принимает:
 Прокси просит DeepSeek вернуть строгий JSON tool call, но также умеет парсить fallback-форматы:
 
 - `TOOL_CALL:`
-- fenced JSON
+- fenced JSON with an explicit `tool_call`, `tool_calls`, or `function_call` envelope
 - `<tool_call>...</tool_call>`
+- DeepSeek DSML (`<｜DSML｜tool_calls>...`) и Web-вариант с `<｜｜DSML｜｜ Tool Calls>`
 
 ---
 
@@ -502,7 +521,9 @@ http://host.docker.internal:9655/v1
 http://localhost:9655/v1
 ```
 
-API key можно указать любой: proxy сам ходит в DeepSeek Web через сохранённую browser-сессию.
+Если `PROXY_API_KEY` не задан, API key можно указать любой. Если ключ задан,
+клиент должен передавать именно его — proxy проверяет bearer token перед
+доступом к моделям, сессиям и completions.
 
 ---
 
