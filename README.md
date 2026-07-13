@@ -121,6 +121,17 @@ SKIP_ACCOUNT_MENU=1 npm start
 http://localhost:9655
 ```
 
+По умолчанию proxy доступен только с этого компьютера. Для доступа из сети
+явно задайте адрес и отдельный ключ proxy:
+
+```bash
+HOST=0.0.0.0 PROXY_API_KEY='replace-with-a-long-random-value' npm start
+```
+
+После этого передавайте ключ как `Authorization: Bearer <key>`. Без
+`PROXY_API_KEY` non-health endpoints остаются без авторизации, поэтому не
+публикуйте такой экземпляр в сеть.
+
 ---
 
 ## 🪟 Windows запуск
@@ -502,7 +513,9 @@ http://host.docker.internal:9655/v1
 http://localhost:9655/v1
 ```
 
-API key можно указать любой: proxy сам ходит в DeepSeek Web через сохранённую browser-сессию.
+Если `PROXY_API_KEY` не задан, API key можно указать любой. Если ключ задан,
+клиент должен передавать именно его — proxy проверяет bearer token перед
+доступом к моделям, сессиям и completions.
 
 ---
 

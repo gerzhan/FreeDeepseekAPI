@@ -7,7 +7,7 @@
  * 
  * Per-agent sessions: each unique `user` field gets its own DeepSeek web session.
  * Auto-reset: sessions reset when message chain > 50 messages or age > 2 hours.
- * Listens on 0.0.0.0:9655
+ * Listens on 127.0.0.1:9655 by default (HOST is configurable)
  */
 
 const http = require('http');
@@ -15,6 +15,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const readline = require('readline');
+const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const { solvePOW } = require('./lib/pow');
 
@@ -40,7 +41,8 @@ const SERVER_PUBLIC_IP = (() => {
 
 const FORGETMEAI_WATERMARK = 't.me/forgetmeai';
 const PORT = Number(process.env.PORT || 9655);
-const HOST = process.env.HOST || '0.0.0.0';
+const HOST = process.env.HOST || '127.0.0.1';
+const PROXY_API_KEY = String(process.env.PROXY_API_KEY || '');
 function formatWatermark(prefix = 'ForgetMeAI') { return `${prefix}: ${FORGETMEAI_WATERMARK}`; }
 function printBanner() {
     console.log(`
@@ -59,6 +61,18 @@ function prompt(question) {
     return new Promise(resolve => rl.question(question, ans => { rl.close(); resolve(ans); }));
 }
 function isTruthy(value) { return typeof value === 'string' && ['1','true','yes','on'].includes(value.trim().toLowerCase()); }
+
+function isProxyAuthorized(authorization, expectedKey = PROXY_API_KEY) {
+    if (!expectedKey) return true;
+    if (typeof authorization !== 'string' || !authorization.startsWith('Bearer ')) return false;
+    const supplied = Buffer.from(authorization.slice('Bearer '.length), 'utf8');
+    const expected = Buffer.from(String(expectedKey), 'utf8');
+    return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+}
+
+function isLoopbackHost(host) {
+    return host === '127.0.0.1' || host === '::1' || host === 'localhost';
+}
 
 // === Per-Agent Session Store ===
 const sessions = new Map();  // keyed by agent ID (from `user` field)
@@ -1145,6 +1159,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    const isPublicProbe = req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health' || url.pathname === '/readyz');
+    if (!isPublicProbe && !isProxyAuthorized(req.headers.authorization)) {
+        res.writeHead(401, {
+            'Content-Type': 'application/json',
+            'WWW-Authenticate': 'Bearer',
+        });
+        res.end(JSON.stringify({ error: { message: 'Invalid or missing proxy API key', type: 'authentication_error' } }));
+        return;
+    }
 
     // Health check
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
@@ -1651,6 +1674,9 @@ async function showStartupMenu() {
 
 async function main() {
     printBanner();
+    if (!isLoopbackHost(HOST) && !PROXY_API_KEY) {
+        console.warn(`[DS-API] WARNING: HOST=${HOST} exposes the proxy without authentication. Set PROXY_API_KEY or bind to 127.0.0.1.`);
+    }
     const shouldStart = await showStartupMenu();
     if (!shouldStart) process.exit(0);
     server.on('error', (err) => {
@@ -1699,5 +1725,7 @@ module.exports = {
         createSession,
         sweepIdleSessions,
         sessions,
+        isProxyAuthorized,
+        isLoopbackHost,
     },
 };

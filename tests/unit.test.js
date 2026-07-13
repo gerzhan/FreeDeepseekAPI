@@ -152,3 +152,18 @@ test('sweepIdleSessions evicts only idle entries', () => {
   assert.equal(serverInternals.sessions.has('fresh-x'), true);
   serverInternals.sessions.delete('fresh-x');
 });
+
+test('proxy API key authentication is optional and uses exact bearer tokens', () => {
+  assert.equal(serverInternals.isProxyAuthorized(undefined, ''), true);
+  assert.equal(serverInternals.isProxyAuthorized('Bearer secret', 'secret'), true);
+  assert.equal(serverInternals.isProxyAuthorized('Bearer wrong', 'secret'), false);
+  assert.equal(serverInternals.isProxyAuthorized('Basic secret', 'secret'), false);
+  assert.equal(serverInternals.isProxyAuthorized('Bearer secret ', 'secret'), false);
+});
+
+test('loopback host detection covers supported local bind addresses', () => {
+  assert.equal(serverInternals.isLoopbackHost('127.0.0.1'), true);
+  assert.equal(serverInternals.isLoopbackHost('::1'), true);
+  assert.equal(serverInternals.isLoopbackHost('localhost'), true);
+  assert.equal(serverInternals.isLoopbackHost('0.0.0.0'), false);
+});
