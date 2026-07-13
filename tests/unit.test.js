@@ -111,6 +111,42 @@ test('chrome auth prints actionable OS instructions when Chrome is missing', () 
   assert.match(out, /CHROME_PATH/i);
 });
 
+test('chrome extension manifest only declares icon files that exist', () => {
+  const manifestPath = path.join(ROOT, 'chrome-extension', 'manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const iconPaths = [];
+
+  function collectIconPaths(value, key = '') {
+    if (typeof value === 'string') {
+      if (key === 'icons' || key === 'default_icon') iconPaths.push(value);
+      return;
+    }
+
+    if (!value || typeof value !== 'object') return;
+
+    if ((key === 'icons' || key === 'default_icon') && !Array.isArray(value)) {
+      for (const iconPath of Object.values(value)) {
+        if (typeof iconPath === 'string') iconPaths.push(iconPath);
+      }
+      return;
+    }
+
+    for (const [childKey, childValue] of Object.entries(value)) {
+      collectIconPaths(childValue, childKey);
+    }
+  }
+
+  collectIconPaths(manifest);
+
+  for (const iconPath of iconPaths) {
+    assert.equal(
+      fs.existsSync(path.join(path.dirname(manifestPath), iconPath)),
+      true,
+      `Missing extension icon declared in manifest: ${iconPath}`,
+    );
+  }
+});
+
 test('DeepSeek stream parser treats SEARCH fragments as assistant output', () => {
   const rebuilt = serverInternals.rebuildFragmentText([
     { type: 'SEARCH', content: 'The official Reuters website is ' },
