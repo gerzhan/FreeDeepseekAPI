@@ -347,8 +347,16 @@ test('tool schema compaction drops prose annotations but preserves validation sh
     properties: {
       command: { type: 'string', description: 'large property description' },
       count: { type: 'integer', minimum: 1 },
+      description: { type: 'string', description: 'annotation, not the property name' },
+      title: { type: 'boolean', title: 'annotation, not the property name' },
+      nested: {
+        anyOf: [
+          { type: 'string', description: 'remove from array item one' },
+          { type: 'integer', title: 'remove from array item two' },
+        ],
+      },
     },
-    required: ['command'],
+    required: ['command', 'description', 'title'],
   });
 
   assert.deepEqual(compact, {
@@ -356,8 +364,11 @@ test('tool schema compaction drops prose annotations but preserves validation sh
     properties: {
       command: { type: 'string' },
       count: { type: 'integer', minimum: 1 },
+      description: { type: 'string' },
+      title: { type: 'boolean' },
+      nested: { anyOf: [{ type: 'string' }, { type: 'integer' }] },
     },
-    required: ['command'],
+    required: ['command', 'description', 'title'],
   });
 });
 
@@ -393,4 +404,115 @@ test('context-too-long detector recognizes DeepSeek localized errors', () => {
   assert.equal(serverInternals.isContextTooLongError({ content: 'Содержание слишком длинное. Сократите его и попробуйте снова.' }), true);
   assert.equal(serverInternals.isContextTooLongError({ content: 'Maximum context length exceeded' }), true);
   assert.equal(serverInternals.isContextTooLongError({ content: 'Temporary backend overload' }), false);
+});
+
+test('empty-response retry keeps recovery history unless a smaller global cap requires compaction', () => {
+  const system = 'SYSTEM';
+  const history = '[Previous conversation]\nUser: old\nAssistant: answer\n\n[Continue from here]\n\n';
+  const conversation = 'User: follow up';
+  const initial = serverInternals.buildBoundedPrompt(system, history, conversation, 5000);
+  const unchangedRetry = serverInternals.buildRetryPrompt(system, history, conversation, initial.prompt, 4000);
+
+  assert.equal(unchangedRetry.compacted, false);
+  assert.match(unchangedRetry.prompt, /Previous conversation/);
+  assert.match(unchangedRetry.prompt, /Assistant: answer/);
+
+  const largeConversation = `TASK_START\n${'x'.repeat(9000)}\nLATEST_RESULT`;
+  const largeInitial = serverInternals.buildBoundedPrompt(system, history, largeConversation, 8000);
+  const smallerRetry = serverInternals.buildRetryPrompt(system, history, largeConversation, largeInitial.prompt, 4000);
+  assert.equal(smallerRetry.compacted, true);
+  assert.ok(smallerRetry.prompt.length <= 4000);
+  assert.match(smallerRetry.prompt, /TASK_START/);
+  assert.match(smallerRetry.prompt, /LATEST_RESULT/);
+});
+
+test('remote reset preserves local history and sticky account while returning failure diagnostics', () => {
+  const session = serverInternals.createSession();
+  session.id = 'failed-session';
+  session.parentMessageId = 'parent';
+  session.createdAt = 123;
+  session.messageCount = 17;
+  session.accountId = 'account_2';
+  session.history.push({ user: 'old task', assistant: 'old answer' });
+
+  const failure = serverInternals.resetRemoteSession(session);
+  assert.deepEqual(failure, {
+    failedSessionId: 'failed-session',
+    failedMessageCount: 17,
+    accountId: 'account_2',
+  });
+  assert.equal(session.id, null);
+  assert.equal(session.parentMessageId, null);
+  assert.equal(session.createdAt, null);
+  assert.equal(session.messageCount, 0);
+  assert.equal(session.accountId, 'account_2');
+  assert.equal(session.history.length, 1);
+});
+
+test('TTL and depth rollover happens before prompt construction and preserves recovery state', () => {
+  const depthSession = serverInternals.createSession();
+  depthSession.id = 'deep-session';
+  depthSession.messageCount = 100;
+  depthSession.accountId = 'account_1';
+  depthSession.history.push({ user: 'u', assistant: 'a' });
+  const depthReset = serverInternals.prepareSessionForPrompt(depthSession, Date.now());
+  assert.equal(depthReset.reason, 'max_message_depth');
+  assert.equal(depthSession.id, null);
+  assert.equal(depthSession.history.length, 1);
+  assert.equal(depthSession.accountId, 'account_1');
+
+  const now = Date.now();
+  const ttlSession = serverInternals.createSession();
+  ttlSession.id = 'old-session';
+  ttlSession.createdAt = now - (2 * 60 * 60 * 1000) - 1;
+  const ttlReset = serverInternals.prepareSessionForPrompt(ttlSession, now);
+  assert.equal(ttlReset.reason, 'session_ttl');
+  assert.equal(ttlReset.failedSessionId, 'old-session');
+});
+
+test('tool results use the global prompt cap instead of an unconditional 8k truncation', () => {
+  const toolResult = `RESULT_START\n${'z'.repeat(12000)}\nRESULT_END`;
+  const formatted = serverInternals.formatMessages([
+    { role: 'user', content: 'inspect this' },
+    { role: 'tool', content: toolResult },
+  ], []);
+
+  assert.match(formatted.prompt, /RESULT_START/);
+  assert.match(formatted.prompt, /RESULT_END/);
+  assert.ok(formatted.prompt.length > 12000);
+
+  const bounded = serverInternals.buildBoundedPrompt(formatted.systemPrompt, '', formatted.prompt, 5000);
+  assert.equal(bounded.compacted, true);
+  assert.ok(bounded.prompt.length <= 5000);
+  assert.match(bounded.prompt, /RESULT_END/);
+});
+
+test('retry state clears a stale finish reason and failure classes use protocol-appropriate status codes', () => {
+  const retry = serverInternals.normalizeRetryResponse({ content: 'recovered', finishReason: null });
+  assert.equal(retry.finishReason, null);
+
+  assert.deepEqual(
+    serverInternals.classifyRecoveryFailure({ content: 'Maximum context length exceeded' }, false),
+    { status: 400, type: 'context_length_exceeded' },
+  );
+  assert.deepEqual(
+    serverInternals.classifyRecoveryFailure(null, true),
+    { status: 504, type: 'request_timeout' },
+  );
+  assert.deepEqual(
+    serverInternals.classifyRecoveryFailure(null, false),
+    { status: 502, type: 'empty_response' },
+  );
+  assert.equal(serverInternals.isTimeoutError({ name: 'TimeoutError', message: 'operation timed out' }), true);
+  assert.equal(serverInternals.isTimeoutError(new Error('ordinary upstream error')), false);
+});
+
+test('context-compaction header is marked and exposed to browser clients', () => {
+  const headers = new Map();
+  const response = { setHeader: (name, value) => headers.set(name, value) };
+  serverInternals.setCorsResponseHeaders(response);
+  serverInternals.markContextCompacted(response);
+
+  assert.equal(headers.get('Access-Control-Expose-Headers'), serverInternals.CONTEXT_COMPACTED_HEADER);
+  assert.equal(headers.get(serverInternals.CONTEXT_COMPACTED_HEADER), 'true');
 });

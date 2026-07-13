@@ -106,6 +106,16 @@ function isBrowserOriginAllowed(origin, allowedOrigins = PROXY_CORS_ORIGINS) {
     }
 }
 
+const CONTEXT_COMPACTED_HEADER = 'X-FreeDeepseek-Context-Compacted';
+function setCorsResponseHeaders(res) {
+    res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Expose-Headers', CONTEXT_COMPACTED_HEADER);
+}
+function markContextCompacted(res) {
+    res.setHeader(CONTEXT_COMPACTED_HEADER, 'true');
+}
+
 // === Per-Agent Session Store ===
 const sessions = new Map();  // keyed by agent ID (from `user` field)
 const MAX_HISTORY_LENGTH = 15;
@@ -292,6 +302,30 @@ function createSession() {
     };
 }
 
+function resetRemoteSession(session) {
+    const failed = {
+        failedSessionId: session.id,
+        failedMessageCount: session.messageCount,
+        accountId: session.accountId,
+    };
+    session.id = null;
+    session.parentMessageId = null;
+    session.createdAt = null;
+    session.messageCount = 0;
+    // Keep local recovery history and the sticky account assignment. A remote
+    // chat can be unhealthy without invalidating either of those local hints.
+    return failed;
+}
+
+function prepareSessionForPrompt(session, now = Date.now()) {
+    if (!session || !session.id) return null;
+    let reason = null;
+    if (session.messageCount >= MAX_MESSAGE_DEPTH) reason = 'max_message_depth';
+    else if (session.createdAt && now - session.createdAt > SESSION_TTL_MS) reason = 'session_ttl';
+    if (!reason) return null;
+    return { reason, ...resetRemoteSession(session) };
+}
+
 function getOrCreateAgentSession(agentId) {
     if (!sessions.has(agentId)) {
         sessions.set(agentId, createSession());
@@ -471,23 +505,12 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     account.lastUsedAt = Date.now();
     const agentTag = `[${agentId}/acct:${account.id}]`;
 
-    // Auto-reset on deep message chain
-    if (session.id && session.messageCount >= MAX_MESSAGE_DEPTH) {
-        console.log(`${agentTag} Session ${session.id} hit ${session.messageCount} messages. Auto-resetting.`);
-        session.id = null;
-        session.parentMessageId = null;
-        session.createdAt = null;
-        session.messageCount = 0;
-        // History preserved for context injection
-    }
-
-    // Reset expired sessions (DeepSeek web sessions last ~1-2 hours)
-    if (session.id && session.createdAt && (Date.now() - session.createdAt > SESSION_TTL_MS)) {
-        console.log(`${agentTag} Session ${session.id} expired (age: ${Math.round((Date.now() - session.createdAt) / 60000)}min). Creating new...`);
-        session.id = null;
-        session.parentMessageId = null;
-        session.createdAt = null;
-        session.messageCount = 0;
+    // Normally this rollover is performed before the prompt is built, so local
+    // recovery history can be injected. Keep this guard for direct callers and
+    // concurrent requests that may have advanced the same session meanwhile.
+    const rollover = prepareSessionForPrompt(session);
+    if (rollover) {
+        console.log(`${agentTag} Session ${rollover.failedSessionId} reset before upstream call (${rollover.reason}).`);
     }
 
     const cr = await dsFetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
@@ -553,10 +576,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
         console.log(`${agentTag} Session error (${resp.status}): ${errText.substring(0, 100)}`);
         if (resp.status === 400 || resp.status === 404 || resp.status === 500) {
             console.log(`${agentTag} Session ${session.id} expired. Creating new session...`);
-            session.id = null;
-            session.parentMessageId = null;
-            session.createdAt = null;
-            session.messageCount = 0;
+            resetRemoteSession(session);
 
             const sr2 = await dsFetch('https://chat.deepseek.com/api/v0/chat_session/create', {
                 method: 'POST', headers: dsHeaders, body: '{}'
@@ -598,15 +618,21 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
 
 // === Tool Calling Support ===
 
-function compactToolSchema(value) {
-    if (Array.isArray(value)) return value.map(compactToolSchema);
+const TOOL_SCHEMA_ANNOTATION_KEYS = new Set(['description', 'examples', '$comment', 'title']);
+const TOOL_SCHEMA_MAP_KEYS = new Set(['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas']);
+
+function compactToolSchema(value, preserveMapKeys = false) {
+    if (Array.isArray(value)) return value.map(child => compactToolSchema(child, false));
     if (!value || typeof value !== 'object') return value;
     const compact = {};
     for (const [key, child] of Object.entries(value)) {
         // Descriptions/examples dominate large agent tool payloads but do not
-        // affect argument validation. Keep the structural schema intact.
-        if (key === 'description' || key === 'examples' || key === '$comment' || key === 'title') continue;
-        compact[key] = compactToolSchema(child);
+        // affect argument validation. A schema can also legally define an
+        // argument *named* "description" or "title", so keys inside schema maps
+        // must not be mistaken for annotations.
+        if (!preserveMapKeys && TOOL_SCHEMA_ANNOTATION_KEYS.has(key)) continue;
+        const childIsSchemaMap = !preserveMapKeys && TOOL_SCHEMA_MAP_KEYS.has(key);
+        compact[key] = compactToolSchema(child, childIsSchemaMap);
     }
     return compact;
 }
@@ -1459,6 +1485,19 @@ function buildBoundedPrompt(systemPrompt, historyPrefix, conversationPrompt, max
     };
 }
 
+function buildRetryPrompt(systemPrompt, historyPrefix, conversationPrompt, currentPrompt, maxChars) {
+    const retryBuild = buildBoundedPrompt(systemPrompt, historyPrefix, conversationPrompt, maxChars);
+    const current = String(currentPrompt || '');
+    const prompt = retryBuild.prompt.length < current.length ? retryBuild.prompt : current;
+    return {
+        prompt,
+        compacted: prompt.length < current.length,
+        historyDropped: prompt === retryBuild.prompt && retryBuild.historyDropped,
+        originalChars: retryBuild.originalChars,
+        promptChars: prompt.length,
+    };
+}
+
 function appendPromptInstruction(promptText, instruction, maxChars = MAX_UPSTREAM_PROMPT_CHARS) {
     const suffix = `\n\n${String(instruction || '').trim()}`;
     const baseBudget = Math.max(0, maxChars - suffix.length);
@@ -1470,6 +1509,27 @@ function isContextTooLongError(error) {
         ? error
         : `${error?.content || ''} ${error?.message || ''} ${error?.finish_reason || ''} ${error?.type || ''}`;
     return /(?:content|prompt|context).{0,40}(?:too\s+long|too\s+large|length|limit|maximum)|maximum.{0,30}(?:context|token)|too\s+many\s+tokens|содержани[ея]\s+слишком\s+длин|контекст.{0,30}(?:длин|лимит)|内容.{0,12}(?:过长|太长)|上下文.{0,12}(?:过长|超出)/i.test(message);
+}
+
+function normalizeRetryResponse(result) {
+    return {
+        content: result?.content ? sanitizeContent(result.content) : '',
+        reasoningContent: result?.reasoningContent ? sanitizeContent(result.reasoningContent) : '',
+        finishReason: result?.finishReason ?? null,
+        modelError: result?.modelError || null,
+    };
+}
+
+function classifyRecoveryFailure(modelError, timedOut = false) {
+    if (isContextTooLongError(modelError)) return { status: 400, type: 'context_length_exceeded' };
+    if (timedOut) return { status: 504, type: 'request_timeout' };
+    return { status: 502, type: modelError?.type || 'empty_response' };
+}
+
+function isTimeoutError(error) {
+    const name = String(error?.name || '');
+    const message = String(error?.message || '');
+    return name === 'TimeoutError' || name === 'AbortError' || /(?:timed?\s*out|timeout)/i.test(message);
 }
 
 function formatMessages(messages, tools) {
@@ -1499,10 +1559,10 @@ function formatMessages(messages, tools) {
         } else if (msg.role === 'tool' && msg.content) {
             // Tool execution result — send back to DeepSeek as context
             const toolContent = normalizeMessageContent(msg.content);
-            const truncated = toolContent.length > 8000
-                ? truncatePromptMiddle(toolContent, 8000, 0.35)
-                : toolContent;
-            conversation += `[Tool Result]\n${truncated}\n\n`;
+            // Do not impose a second, per-result 8k limit: one large tool result
+            // may be the essential input. buildBoundedPrompt applies the single
+            // global request cap while preserving the latest conversation tail.
+            conversation += `[Tool Result]\n${toolContent}\n\n`;
         }
     }
     // The last user message + full conversation context
@@ -1519,8 +1579,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
     if (requestOrigin) res.setHeader('Access-Control-Allow-Origin', normalizeOrigin(requestOrigin));
-    res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    setCorsResponseHeaders(res);
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -1651,6 +1710,8 @@ const server = http.createServer(async (req, res) => {
         res.on('close', () => { clientGone = true; });
         const requestStartedAt = Date.now();
         const deadlineHit = () => Date.now() - requestStartedAt > REQUEST_DEADLINE_MS;
+        let activeSession = null;
+        let activeAgentId = null;
         try {
             const rawParams = JSON.parse(body || '{}');
             const params = normalizeApiParams(rawParams, apiMode);
@@ -1676,6 +1737,7 @@ const server = http.createServer(async (req, res) => {
                 ? String(requestedSession)
                 : ((remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1') ? 'dev-agent' : remoteAddr);
             const agentTag = `[${agentId}]`;
+            activeAgentId = agentId;
 
             // "/new" command: if the latest user message is exactly "/new" (whitespace-insensitive),
             // reset this agent's DeepSeek session/history instead of forwarding anything to DeepSeek.
@@ -1717,6 +1779,14 @@ const server = http.createServer(async (req, res) => {
             const clientPromptText = messages.map(m => normalizeMessageContent(m.content)).join('\n');
 
             const session = getOrCreateAgentSession(agentId);
+            activeSession = session;
+
+            // Roll over TTL/depth-limited sessions before deciding whether to
+            // inject local recovery history into the newly built prompt.
+            const promptRollover = prepareSessionForPrompt(session);
+            if (promptRollover) {
+                console.log(`${agentTag} Session ${promptRollover.failedSessionId} reset before prompt build (${promptRollover.reason}); recovery history preserved.`);
+            }
 
             // Build history prefix if starting fresh
             let historyPrefix = '';
@@ -1730,8 +1800,9 @@ const server = http.createServer(async (req, res) => {
 
             const promptBuild = buildBoundedPrompt(systemPrompt, historyPrefix, prompt);
             let fullPrompt = promptBuild.prompt;
+            let promptCompacted = promptBuild.compacted;
             if (promptBuild.compacted) {
-                res.setHeader('X-FreeDeepseek-Context-Compacted', 'true');
+                markContextCompacted(res);
                 console.log(`${agentTag} Compacted upstream prompt ${promptBuild.originalChars} -> ${promptBuild.promptChars} chars${promptBuild.historyDropped ? ' (recovery history dropped)' : ''}`);
             }
 
@@ -1855,53 +1926,55 @@ const server = http.createServer(async (req, res) => {
                     ? Math.max(0.35, 0.8 - retryAttempt * 0.2)
                     : Math.max(0.5, 1 - retryAttempt * 0.2);
                 const retryBudget = Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(MAX_UPSTREAM_PROMPT_CHARS * retryRatio));
-                const retryBuild = buildBoundedPrompt(systemPrompt, '', prompt, retryBudget);
-                const retryPrompt = retryBuild.prompt.length < fullPrompt.length ? retryBuild.prompt : fullPrompt;
+                const retryBuild = buildRetryPrompt(systemPrompt, historyPrefix, prompt, fullPrompt, retryBudget);
+                const retryPrompt = retryBuild.prompt;
+                if (retryBuild.compacted) {
+                    promptCompacted = true;
+                    markContextCompacted(res);
+                }
                 const reason = contextTooLong ? 'context-too-long response' : 'empty response';
                 console.log(`${agentTag} ${reason} (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_EMPTY_RETRIES}, prompt=${retryPrompt.length} chars). Resetting session...`);
-                session.id = null;
-                session.parentMessageId = null;
-                session.createdAt = null;
-                session.messageCount = 0;
+                resetRemoteSession(session);
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(500 * retryAttempt, 1500)));
                 const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel);
                 const retryResult = await readDeepSeekResponse(retryResp.body);
-                const retryContent = retryResult && retryResult.content ? sanitizeContent(retryResult.content) : '';
-                const retryReasoning = retryResult && retryResult.reasoningContent ? sanitizeContent(retryResult.reasoningContent) : '';
+                const retryState = normalizeRetryResponse(retryResult);
                 fullPrompt = retryPrompt;
-                modelError = retryResult?.modelError || null;
-                finishReason = retryResult?.finishReason || finishReason;
-                if (retryContent && retryContent.trim().length > 0) {
+                modelError = retryState.modelError;
+                // A previous empty response may have carried finish_reason=length.
+                // Never leak it into a successful retry that supplied no reason.
+                finishReason = retryState.finishReason;
+                if (retryState.content && retryState.content.trim().length > 0) {
                     console.log(`${agentTag} Retry ${retryAttempt} succeeded`);
-                    fullContent = retryContent;
-                    reasoningContent = retryReasoning;
+                    fullContent = retryState.content;
+                    reasoningContent = retryState.reasoningContent;
                 }
             }
 
             if (!fullContent || fullContent.trim().length === 0) {
-                const contextTooLong = isContextTooLongError(modelError);
                 const timedOut = deadlineHit();
-                const errorType = contextTooLong
-                    ? 'context_length_exceeded'
-                    : (timedOut ? 'request_timeout' : (modelError?.type || 'empty_response'));
+                const failureClass = classifyRecoveryFailure(modelError, timedOut);
+                const failure = resetRemoteSession(session);
+                const errorType = failureClass.type;
                 const errorMessage = modelError?.content
                     || (timedOut
                         ? 'DeepSeek request deadline reached while recovering an empty response'
                         : `DeepSeek returned empty content after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}`);
                 console.log(`${agentTag} ${errorType} after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}. Giving up.`);
-                res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.writeHead(failureClass.status, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                     error: {
                         message: errorMessage,
                         type: errorType,
                         agent: agentId,
-                        session_id: session.id,
-                        message_count: session.messageCount,
+                        failed_session_id: failure.failedSessionId,
+                        message_count: failure.failedMessageCount,
                         history_length: session.history.length,
+                        account: failure.accountId,
                         retry_attempts: retryAttempt,
                         upstream_prompt_chars: fullPrompt.length,
-                        prompt_compacted: promptBuild.compacted || fullPrompt.length < promptBuild.promptChars,
+                        prompt_compacted: promptCompacted,
                         model: requestedModel,
                         real_model: resolveModelConfig(requestedModel).real_model,
                     }
@@ -1953,10 +2026,7 @@ const server = http.createServer(async (req, res) => {
             // malformed. Never pass raw DSML through as a normal assistant turn.
             if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent) && !clientGone && !deadlineHit()) {
                 console.log(`${agentTag} Tool-call markup detected but invalid/truncated (${fullContent.length} chars). Retrying with stricter prompt...`);
-                session.id = null;
-                session.parentMessageId = null;
-                session.createdAt = null;
-                session.messageCount = 0;
+                resetRemoteSession(session);
                 await new Promise(r => setTimeout(r, 1000));
                 const strictPrompt = appendPromptInstruction(
                     fullPrompt,
@@ -1980,10 +2050,17 @@ const server = http.createServer(async (req, res) => {
             }
 
             if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent)) {
+                const failure = resetRemoteSession(session);
                 res.writeHead(502, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: {
                     message: 'DeepSeek returned malformed tool-call markup after one repair attempt',
                     type: 'malformed_tool_call',
+                    agent: agentId,
+                    failed_session_id: failure.failedSessionId,
+                    message_count: failure.failedMessageCount,
+                    history_length: session.history.length,
+                    account: failure.accountId,
+                    prompt_compacted: promptCompacted,
                     model: requestedModel,
                     real_model: resolveModelConfig(requestedModel).real_model,
                 } }));
@@ -2032,11 +2109,23 @@ const server = http.createServer(async (req, res) => {
             if (res.headersSent || clientGone) return;  // streamed/aborted: nothing to send
             // Pool exhaustion / no-auth carry an explicit status so integrators see
             // 429/503 (not a generic 500) and can honor Retry-After.
-            const status = e.status || 500;
+            const timedOut = isTimeoutError(e);
+            const status = e.status || (timedOut ? 504 : 500);
             const headers = { 'Content-Type': 'application/json' };
             if (status === 429 && e.retryAfter) headers['Retry-After'] = String(e.retryAfter);
             res.writeHead(status, headers);
-            res.end(JSON.stringify({ error: { message: e.message, type: e.type || 'server_error' } }));
+            const failure = timedOut && activeSession ? resetRemoteSession(activeSession) : null;
+            res.end(JSON.stringify({ error: {
+                message: e.message,
+                type: e.type || (timedOut ? 'request_timeout' : 'server_error'),
+                ...(failure ? {
+                    agent: activeAgentId,
+                    failed_session_id: failure.failedSessionId,
+                    message_count: failure.failedMessageCount,
+                    history_length: activeSession.history.length,
+                    account: failure.accountId,
+                } : {}),
+            } }));
         } finally {
             inFlight--;
         }
@@ -2154,13 +2243,23 @@ module.exports = {
         truncatePromptMiddle,
         hasExplicitConversationHistory,
         buildBoundedPrompt,
+        buildRetryPrompt,
         isContextTooLongError,
+        normalizeRetryResponse,
+        classifyRecoveryFailure,
+        isTimeoutError,
+        formatMessages,
         createSession,
+        resetRemoteSession,
+        prepareSessionForPrompt,
         sweepIdleSessions,
         sessions,
         isProxyAuthorized,
         isLoopbackHost,
         normalizeOrigin,
         isBrowserOriginAllowed,
+        setCorsResponseHeaders,
+        markContextCompacted,
+        CONTEXT_COMPACTED_HEADER,
     },
 };
