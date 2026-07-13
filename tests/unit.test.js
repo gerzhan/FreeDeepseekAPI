@@ -143,3 +143,12 @@ test('DeepSeek stream parser does not treat service content chunks as model erro
   assert.equal(serverInternals.isDeepSeekModelErrorEvent({ finish_reason: 'stop' }), false);
   assert.equal(serverInternals.isDeepSeekModelErrorEvent({ type: 'error', content: 'backend error' }), true);
 });
+
+test('sweepIdleSessions evicts only idle entries', () => {
+  serverInternals.sessions.set('stale-x', { lastActivityAt: 1 });
+  serverInternals.sessions.set('fresh-x', { lastActivityAt: Date.now() });
+  serverInternals.sweepIdleSessions(60 * 1000);
+  assert.equal(serverInternals.sessions.has('stale-x'), false);
+  assert.equal(serverInternals.sessions.has('fresh-x'), true);
+  serverInternals.sessions.delete('fresh-x');
+});
