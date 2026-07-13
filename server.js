@@ -219,15 +219,10 @@ function selectAccountForSession(session) {
     if (session.accountId) {
         const sticky = accounts.find(a => a.id === session.accountId);
         if (sticky && sticky.config.token && sticky.config.cookie && sticky.cooldownUntil <= now) return sticky;
-        if (sticky && sticky.cooldownUntil > now) {
-            // A DeepSeek chat_session belongs to the auth account that created it.
-            // If that account is rate-limited/expired, do not keep hammering it;
-            // reset the web session and let a healthy account take over.
-            session.id = null;
-            session.parentMessageId = null;
-            session.createdAt = null;
-            session.messageCount = 0;
-        }
+        // A DeepSeek chat_session belongs to the auth account that created it.
+        // If that account disappeared, lost credentials, or is cooling down,
+        // never reuse its session id under a different account.
+        resetRemoteSession(session);
         session.accountId = null;
     }
     const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now);
@@ -513,6 +508,7 @@ function isSupportedModel(model) { return resolveModelConfig(model).supported ==
 async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt) {
     const modelCfg = resolveModelConfig(model);
     const session = getOrCreateAgentSession(agentId);
+    const hadRemoteSession = Boolean(session.id);
     const account = selectAccountForSession(session);
     const dsHeaders = account.headers;
     account.lastUsedAt = Date.now();
@@ -522,7 +518,12 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
     // recovery history can be injected. Keep this guard for direct callers and
     // concurrent requests that may have advanced the same session meanwhile.
     const rollover = prepareSessionForPrompt(session);
-    let effectivePrompt = rollover ? freshSessionPrompt : prompt;
+    const accountRotationReset = hadRemoteSession && !session.id;
+    const recoveredFreshSession = accountRotationReset || Boolean(rollover);
+    let effectivePrompt = recoveredFreshSession ? freshSessionPrompt : prompt;
+    if (accountRotationReset) {
+        console.log(`${agentTag} Account rotation reset the previous remote session; using recovery prompt.`);
+    }
     if (rollover) {
         console.log(`${agentTag} Session ${rollover.failedSessionId} reset before upstream call (${rollover.reason}).`);
     }
@@ -639,7 +640,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
         throw createUpstreamHttpError(resp.status, errText, retryAfter);
     }
 
-    return { resp, agentId, account, promptUsed: effectivePrompt, freshSessionReset: Boolean(rollover) };
+    return { resp, agentId, account, promptUsed: effectivePrompt, freshSessionReset: recoveredFreshSession };
 }
 
 // === Tool Calling Support ===
@@ -1654,6 +1655,14 @@ function appendPromptInstruction(promptText, instruction, maxChars = MAX_UPSTREA
     return truncatePromptMiddle(promptText, baseBudget, 0.35) + suffix;
 }
 
+function isContinuationRecoverySafe(previousAccountId, continuationCall) {
+    const nextAccountId = continuationCall?.account?.id;
+    return !previousAccountId
+        || !nextAccountId
+        || nextAccountId === previousAccountId
+        || continuationCall?.freshSessionReset === true;
+}
+
 function isContextTooLongError(error) {
     const message = typeof error === 'string'
         ? error
@@ -2153,16 +2162,20 @@ const server = http.createServer(async (req, res) => {
                     `${freshPromptBuild.prompt}\n\n[Assistant response so far]\n${fullContent}`,
                     'Continue the assistant response from exactly where it stopped. Do not restart or repeat completed sections.'
                 );
-                const { resp: contResp, account: contAccount } = await askDeepSeekStream(
+                const continuationCall = await askDeepSeekStream(
                     'continue',
                     agentId,
                     requestedModel,
                     continuationRecoveryPrompt
                 );
-                // If rotation moved us to a different account, its chat_session has no
-                // prior context — "continue" would return irrelevant text. Abort (#20).
-                if (contAccount && contBeforeId && contAccount.id !== contBeforeId) {
+                const { resp: contResp, account: contAccount } = continuationCall;
+                // A cross-account continuation is valid only when the call
+                // detected that reset and sent the full recovery prompt. If an
+                // unexpected rotation ever bypasses that guard, discard the new
+                // remote session before returning to the client (#20).
+                if (!isContinuationRecoverySafe(contBeforeId, continuationCall)) {
                     console.log(`${agentTag} continuation rotated to ${contAccount.id} ≠ ${contBeforeId} — skipping (foreign session)`);
+                    resetRemoteSession(session);
                     break;
                 }
                 const contResult = await readDeepSeekResponse(contResp.body);
@@ -2412,6 +2425,7 @@ module.exports = {
         buildRecoveryHistoryPrefix,
         buildBoundedPrompt,
         buildRetryPrompt,
+        isContinuationRecoverySafe,
         isContextTooLongError,
         normalizeRetryResponse,
         classifyRecoveryFailure,
@@ -2422,6 +2436,8 @@ module.exports = {
         prepareSessionForPrompt,
         sweepIdleSessions,
         sessions,
+        accounts,
+        selectAccountForSession,
         isProxyAuthorized,
         isLoopbackHost,
         normalizeOrigin,

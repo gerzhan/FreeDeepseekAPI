@@ -542,6 +542,57 @@ test('remote reset preserves local history and sticky account while returning fa
   assert.equal(session.history.length, 1);
 });
 
+test('account rotation clears a foreign remote session and preserves local recovery history', (t) => {
+  const originalAccounts = serverInternals.accounts.splice(0);
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+  });
+
+  serverInternals.accounts.push(
+    {
+      id: 'cooling',
+      config: { token: 'one', cookie: 'one' },
+      cooldownUntil: Date.now() + 60_000,
+      headers: {},
+    },
+    {
+      id: 'ready',
+      config: { token: 'two', cookie: 'two' },
+      cooldownUntil: 0,
+      headers: {},
+    },
+  );
+  const session = serverInternals.createSession();
+  session.id = 'foreign-session';
+  session.parentMessageId = 'foreign-parent';
+  session.accountId = 'cooling';
+  session.messageCount = 7;
+  session.history.push({ user: 'old task', assistant: 'old answer' });
+
+  const selected = serverInternals.selectAccountForSession(session);
+  assert.equal(selected.id, 'ready');
+  assert.equal(session.accountId, 'ready');
+  assert.equal(session.id, null);
+  assert.equal(session.parentMessageId, null);
+  assert.equal(session.messageCount, 0);
+  assert.equal(session.history.length, 1);
+});
+
+test('cross-account continuation is accepted only with a fresh recovery prompt', () => {
+  assert.equal(serverInternals.isContinuationRecoverySafe('one', {
+    account: { id: 'one' },
+    freshSessionReset: false,
+  }), true);
+  assert.equal(serverInternals.isContinuationRecoverySafe('one', {
+    account: { id: 'two' },
+    freshSessionReset: true,
+  }), true);
+  assert.equal(serverInternals.isContinuationRecoverySafe('one', {
+    account: { id: 'two' },
+    freshSessionReset: false,
+  }), false);
+});
+
 test('TTL and depth rollover happens before prompt construction and preserves recovery state', () => {
   const depthSession = serverInternals.createSession();
   depthSession.id = 'deep-session';
