@@ -132,6 +132,10 @@ HOST=0.0.0.0 PROXY_API_KEY='replace-with-a-long-random-value' npm start
 `PROXY_API_KEY` non-health endpoints остаются без авторизации, поэтому не
 публикуйте такой экземпляр в сеть.
 
+Browser-запросы разрешены с loopback-origin. Если UI открыт на другом адресе,
+добавьте его точный origin через запятую, например
+`PROXY_CORS_ORIGINS=https://ui.example.com,http://192.168.1.20:3000`.
+
 ---
 
 ## 🪟 Windows запуск

@@ -43,6 +43,10 @@ const FORGETMEAI_WATERMARK = 't.me/forgetmeai';
 const PORT = Number(process.env.PORT || 9655);
 const HOST = process.env.HOST || '127.0.0.1';
 const PROXY_API_KEY = String(process.env.PROXY_API_KEY || '');
+const PROXY_CORS_ORIGINS = new Set(String(process.env.PROXY_CORS_ORIGINS || '')
+    .split(',')
+    .map(value => normalizeOrigin(value))
+    .filter(Boolean));
 function formatWatermark(prefix = 'ForgetMeAI') { return `${prefix}: ${FORGETMEAI_WATERMARK}`; }
 function printBanner() {
     console.log(`
@@ -71,7 +75,35 @@ function isProxyAuthorized(authorization, expectedKey = PROXY_API_KEY) {
 }
 
 function isLoopbackHost(host) {
-    return host === '127.0.0.1' || host === '::1' || host === 'localhost';
+    const normalized = String(host || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+    return normalized === '127.0.0.1'
+        || normalized === '::1'
+        || normalized === '::ffff:127.0.0.1'
+        || normalized === 'localhost';
+}
+
+function normalizeOrigin(origin) {
+    const value = String(origin || '').trim().replace(/\/+$/, '');
+    if (!value) return '';
+    try {
+        const parsed = new URL(value);
+        return parsed.origin === 'null' ? value : parsed.origin;
+    } catch (e) {
+        return value;
+    }
+}
+
+function isBrowserOriginAllowed(origin, allowedOrigins = PROXY_CORS_ORIGINS) {
+    if (!origin) return true; // curl, SDKs, and other non-browser clients
+    const normalized = normalizeOrigin(origin);
+    if (allowedOrigins.has(normalized)) return true;
+    try {
+        const parsed = new URL(normalized);
+        return (parsed.protocol === 'http:' || parsed.protocol === 'https:')
+            && isLoopbackHost(parsed.hostname);
+    } catch (e) {
+        return false;
+    }
 }
 
 // === Per-Agent Session Store ===
@@ -1358,7 +1390,14 @@ function formatMessages(messages, tools) {
 
 // === HTTP Server ===
 const server = http.createServer(async (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    const requestOrigin = req.headers.origin;
+    res.setHeader('Vary', 'Origin');
+    if (!isBrowserOriginAllowed(requestOrigin)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Browser origin is not allowed', type: 'cors_error' } }));
+        return;
+    }
+    if (requestOrigin) res.setHeader('Access-Control-Allow-Origin', normalizeOrigin(requestOrigin));
     res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
@@ -1376,8 +1415,19 @@ const server = http.createServer(async (req, res) => {
 
     // Health check
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
+        const includePrivateStatus = !PROXY_API_KEY || isProxyAuthorized(req.headers.authorization);
+        const health = { status: 'ok', service: 'FreeDeepseekAPI', watermark: FORGETMEAI_WATERMARK };
+        if (includePrivateStatus) Object.assign(health, {
+            models: SUPPORTED_MODEL_IDS,
+            unsupported_models: Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported),
+            agents: sessions.size,
+            in_flight: inFlight,
+            accounts: accounts.map(accountStatus),
+            config_ready: hasAuthConfig(),
+            session_reuse: { strategy: 'sticky per x-agent-session/user', ttl_minutes: Math.round(SESSION_TTL_MS / 60000), max_messages: MAX_MESSAGE_DEPTH, reset_all: 'POST /reset-session?agent=all' },
+        });
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', service: 'FreeDeepseekAPI', watermark: FORGETMEAI_WATERMARK, models: SUPPORTED_MODEL_IDS, unsupported_models: Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported), agents: sessions.size, in_flight: inFlight, accounts: accounts.map(accountStatus), config_ready: hasAuthConfig(), session_reuse: { strategy: 'sticky per x-agent-session/user', ttl_minutes: Math.round(SESSION_TTL_MS / 60000), max_messages: MAX_MESSAGE_DEPTH, reset_all: 'POST /reset-session?agent=all' } }));
+        res.end(JSON.stringify(health));
         return;
     }
 
@@ -1989,5 +2039,7 @@ module.exports = {
         sessions,
         isProxyAuthorized,
         isLoopbackHost,
+        normalizeOrigin,
+        isBrowserOriginAllowed,
     },
 };

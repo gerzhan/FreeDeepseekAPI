@@ -164,8 +164,23 @@ test('proxy API key authentication is optional and uses exact bearer tokens', ()
 test('loopback host detection covers supported local bind addresses', () => {
   assert.equal(serverInternals.isLoopbackHost('127.0.0.1'), true);
   assert.equal(serverInternals.isLoopbackHost('::1'), true);
+  assert.equal(serverInternals.isLoopbackHost('[::1]'), true);
+  assert.equal(serverInternals.isLoopbackHost('::ffff:127.0.0.1'), true);
   assert.equal(serverInternals.isLoopbackHost('localhost'), true);
   assert.equal(serverInternals.isLoopbackHost('0.0.0.0'), false);
+});
+
+test('browser origin guard allows local UIs and exact configured origins only', () => {
+  const allowed = new Set(['https://ui.example.com', 'chrome-extension://trusted-id']);
+  assert.equal(serverInternals.isBrowserOriginAllowed(undefined, allowed), true);
+  assert.equal(serverInternals.isBrowserOriginAllowed('http://localhost:3000', allowed), true);
+  assert.equal(serverInternals.isBrowserOriginAllowed('http://127.0.0.1:8080', allowed), true);
+  assert.equal(serverInternals.isBrowserOriginAllowed('http://[::1]:3000', allowed), true);
+  assert.equal(serverInternals.isBrowserOriginAllowed('https://ui.example.com/path', allowed), true);
+  assert.equal(serverInternals.isBrowserOriginAllowed('chrome-extension://trusted-id', allowed), true);
+  assert.equal(serverInternals.isBrowserOriginAllowed('https://evil.example', allowed), false);
+  assert.equal(serverInternals.isBrowserOriginAllowed('chrome-extension://other-id', allowed), false);
+  assert.equal(serverInternals.isBrowserOriginAllowed('null', allowed), false);
 });
 
 test('parseToolCall converts canonical DeepSeek DSML into an OpenAI tool call', () => {
